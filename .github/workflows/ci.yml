@@ -1,4 +1,4 @@
-name: Production CI/CD with Quality Gate
+name: Production CI/CD with Zero-Downtime Blue-Green
 
 on:
   push:
@@ -40,7 +40,7 @@ jobs:
     needs: build-and-push
     runs-on: ubuntu-latest
     steps:
-      - name: SSH and Auto-Deploy to AWS EC2
+      - name: Blue-Green Zero-Downtime Deploy
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
@@ -48,6 +48,40 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
             sudo docker pull abdullah8010/devops-app:latest
-            sudo docker stop web-app || true
-            sudo docker rm web-app || true
-            sudo docker run -d --name web-app -p 80:80 abdullah8010/devops-app:latest
+
+            # 1. Determine active vs target container
+            if grep -q "8081" /etc/nginx/sites-available/default; then
+                OLD_NAME="web-app-blue"
+                NEW_NAME="web-app-green"
+                NEW_PORT=8082
+            else
+                OLD_NAME="web-app-green"
+                NEW_NAME="web-app-blue"
+                NEW_PORT=8081
+            fi
+
+            echo ">>> Active is $OLD_NAME. Deploying $NEW_NAME on port $NEW_PORT..."
+
+            # 2. Spin up new container alongside old one
+            sudo docker rm -f $NEW_NAME || true
+            sudo docker run -d --name $NEW_NAME -p $NEW_PORT:80 abdullah8010/devops-app:latest
+
+            # 3. Healthcheck on internal port
+            sleep 2
+            if ! curl -f http://127.0.0.1:$NEW_PORT; then
+                echo "❌ Healthcheck failed! Aborting."
+                sudo docker rm -f $NEW_NAME
+                exit 1
+            fi
+
+            # 4. Seamless 0ms Traffic Switch
+            sudo sed -i "s/proxy_pass http:\/\/127.0.0.1:[0-9]*/proxy_pass http:\/\/127.0.0.1:$NEW_PORT/" /etc/nginx/sites-available/default
+            sudo nginx -t
+            sudo systemctl reload nginx
+            echo "✅ Traffic switched to $NEW_NAME on port $NEW_PORT!"
+
+            # 5. Safely decommission old container
+            sleep 1
+            sudo docker stop $OLD_NAME || true
+            sudo docker rm $OLD_NAME || true
+            echo "✅ Old container $OLD_NAME safely removed."
